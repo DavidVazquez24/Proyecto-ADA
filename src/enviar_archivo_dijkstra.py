@@ -1,64 +1,39 @@
 import tkinter as tk
 from tkinter import filedialog
-#from index import *
-import heapq
-from ping3 import ping 
 from tkinter import messagebox as mb
 from tkinter import ttk
 import socket
 import os
+import networkx  as nx
+import matplotlib.pyplot as plt
 
 class GUI:
     
     anchoVentana=900
     altoVentana=600
+
+    #IPs de la VPN
     pings = {
     "Raul": "25.4.219.19",
     "Moy": "25.54.198.46",
-    "David": "25.58.36.130"
+    "David": "25.58.36.130",
+    "Sergio": "25.59.171.8"
     }
-    def dijkstra(grafo, inicio, fin):
-        distancias = {nodo: float('inf') for nodo in grafo}
-        distancias[inicio] = 0
-        anterior = {}
-        cola = [(0, inicio)]
-
-        while cola:
-            distancia_actual, nodo_actual = heapq.heappop(cola)
-
-            if nodo_actual == fin:
-                break
-
-            for vecino, peso in grafo[nodo_actual].items():
-                nueva_distancia = distancia_actual + peso
-                if nueva_distancia < distancias[vecino]:
-                    distancias[vecino] = nueva_distancia
-                    anterior[vecino] = nodo_actual
-                    heapq.heappush(cola, (nueva_distancia, vecino))
-
-        # Reconstruir camino
-        camino = []
-        actual = fin
-        while actual in anterior:
-            camino.insert(0, actual)
-            actual = anterior[actual]
-        if camino:
-            camino.insert(0, inicio)
-
-        return camino, distancias[fin]
-    
-    def construir_grafo_latencias(pings):
-        grafo = {nombre: {} for nombre in pings}
-        for origen, ip_origen in pings.items():
-            for destino, ip_destino in pings.items():
-                if origen == destino:
-                    continue
-                latency = ping(ip_destino, timeout=2)
-                if latency:
-                    grafo[origen][destino] = latency * 1000  # ms
-                else:
-                    print(f"Sin respuesta: {origen} -> {destino}")
-        return grafo
+    #Medidas de latencia promedio
+    latencias= [
+    ('Moy', 'David', 30),
+    ('Moy', 'Raul', 29),
+    ('Moy', 'Sergio', 30),
+    ('David', 'Moy', 36),
+    ('David', 'Raul', 14),
+    ('David', 'Sergio', 102),
+    ('Raul', 'Moy', 33),
+    ('Raul', 'David', 10),
+    ('Raul', 'Sergio', 255),
+    ('Sergio', 'Moy', 31),
+    ('Sergio', 'David', 116),
+    ('Sergio', 'Raul', 270),
+    ]
     
     def enviar(self):
         emisor = self.listaIPEmisor.get()
@@ -79,36 +54,64 @@ class GUI:
         emisor_nombre = emisor.split()[0]
         receptor_nombre = receptor.split()[0]
 
-        # Construir el grafo y aplicar Dijkstra
-        grafo = GUI.construir_grafo_latencias(GUI.pings)
-        camino, costo = GUI.dijkstra(grafo, emisor_nombre, receptor_nombre)
+        # Construir grafo
+        grafo = nx.Graph()
+        grafo.add_weighted_edges_from(GUI.latencias)
 
-        if not camino or len(camino) < 2:
-            mb.showerror("Error", "No se encontró un camino entre emisor y receptor")
+        try:
+            camino = nx.dijkstra_path(grafo, source=emisor_nombre, target=receptor_nombre)
+            costo = nx.dijkstra_path_length(grafo, source=emisor_nombre, target=receptor_nombre)
+        except nx.NetworkXNoPath:
+            mb.showerror("ERROR", "No hay ruta entre los nodos seleccionados")
             return
 
-        siguiente_salto = camino[1]  # Nodo siguiente en la ruta
+        # Mostrar la ruta en un gráfico
+        pos = nx.spring_layout(grafo, seed=42)
+        plt.figure(figsize=(8, 6))
+        nx.draw(grafo, pos, with_labels=True, node_color='lightblue', node_size=1000, font_weight='bold')
+        labels = nx.get_edge_attributes(grafo, 'weight')
+        labels = {k: f"{v:.1f} ms" for k, v in labels.items()}
+        nx.draw_networkx_edge_labels(grafo, pos, edge_labels=labels)
+        path_edges = list(zip(camino, camino[1:]))
+        nx.draw_networkx_edges(grafo, pos, edgelist=path_edges, edge_color='red', width=3)
+        plt.title(f"Ruta de {emisor_nombre} a {receptor_nombre} ({costo:.2f} ms)")
+        plt.show()
+
+        print("Ruta calculada:", camino)
+
+        # Obtener el siguiente nodo y su IP
+        siguiente_salto = camino[1]  # El primer salto después del emisor
+        ruta_restante = camino[1:]  # Desde el primer nodo hasta el destino
+
         ip_destino = GUI.pings[siguiente_salto]
-        puerto = 5201  # Asegúrate de que el receptor use este puerto
+        puerto = 5201
 
         try:
             with socket.socket() as s:
                 s.connect((ip_destino, puerto))
-                s.send(os.path.basename(self.archivo).encode())  # Enviar nombre del archivo
+                # Enviar nombre del archivo
+                s.send(os.path.basename(self.archivo).encode())
+                s.recv(1024)  # Esperar confirmación
+
+                # Enviar la ruta restante como cadena
+                s.send(",".join(ruta_restante).encode())
+                s.recv(1024)  # Esperar confirmación
+
+                # Enviar el archivo por partes
                 with open(self.archivo, 'rb') as f:
                     while True:
                         datos = f.read(1024)
                         if not datos:
                             break
                         s.send(datos)
-            mb.showinfo("Éxito", f"Archivo enviado a {siguiente_salto} ({ip_destino})\nRuta: {' ➜ '.join(camino)}\nLatencia total estimada: {costo:.2f} ms")
+                s.send(b"DONE")  # Señal de fin de archivo
+
+            mb.showinfo("Éxito", f"Archivo: {self.archivo} enviado a {siguiente_salto} ({ip_destino})\nRuta: {' ➜ '.join(camino)}\nLatencia estimada: {costo:.2f} ms")
         except Exception as e:
             mb.showerror("Error", f"No se pudo enviar el archivo a {ip_destino}:\n{e}")
 
         self.archivo = ""
         self.etiquetaArchivo.config(text="Ningún archivo seleccionado")
-
-
 
     def seleccionar_archivo(self):
         self.archivo = filedialog.askopenfilename(
